@@ -1,5 +1,5 @@
 ---
-name: weather-skill
+name: weather
 description: >
   Fetches current weather conditions and forecasts for any location worldwide.
   Use this skill whenever the user asks about weather, temperature, rain, wind,
@@ -11,98 +11,110 @@ description: >
 
 # Weather Skill
 
-Provides current weather and forecasts for any location using two free APIs:
-- **Nominatim** (OpenStreetMap) for geocoding locations → `scripts/geocode.py`
-- **Open-Meteo** for weather data → `scripts/fetch_weather.py`
+Provides current weather and forecasts for any location using **Open-Meteo** free APIs called directly via `WebFetch`:
+- **Open-Meteo Geocoding** for resolving location names to coordinates
+- **Open-Meteo Forecast** for weather data
 
 ---
 
 ## Workflow
 
 1. **Understand the user's request.** Extract the location, time range, and whether they're planning travel. See examples below.
-2. **Geocode the location** by running `scripts/geocode.py "<location>"`. It returns JSON with `display_name`, `lat`, `lon`, and an `ambiguous` flag. If ambiguous, ask the user to clarify.
-3. **Fetch weather** by running `scripts/fetch_weather.py` with the lat/lon and appropriate flags. See script usage below.
+2. **Geocode the location** using `WebFetch` to call the Nominatim API (see below). If the result is ambiguous, ask the user to clarify.
+3. **Fetch weather** using `WebFetch` to call the Open-Meteo API with the lat/lon and appropriate parameters (see below).
 4. **Respond to the user** with a clear summary. See example outputs below.
 5. **If travel intent is detected**, also read `references/clothing_guide.md` and include relevant clothing advice.
 
 ---
 
-## Scripts
+## API Calls
 
-### Geocode: `scripts/geocode.py`
+### Step 1: Geocode with Open-Meteo Geocoding
 
-Converts a location string to coordinates.
+Use `WebFetch` to GET:
 
-```bash
-python scripts/geocode.py "Tokyo"
-python scripts/geocode.py "King Abdullah Financial District, Riyadh"
-python scripts/geocode.py "Times Square, New York"
+```
+https://geocoding-api.open-meteo.com/v1/search?name={location}&count=3&language=en&format=json
 ```
 
-Returns JSON:
-```json
-{
-  "display_name": "Tokyo, Japan",
-  "lat": 35.6764,
-  "lon": 139.6500,
-  "importance": 0.82,
-  "ambiguous": false
-}
+Replace `{location}` with the URL-encoded location string (e.g., `Tokyo`, `Riyadh`).
+
+**Response** is a JSON object with a `results` array. Each item has:
+- `name` — location name
+- `latitude`, `longitude` — coordinates (floats)
+- `country` — country name
+- `admin1` — state/region (optional)
+- `population` — population count (optional, useful for disambiguation)
+
+**Ambiguity logic:** If there are ≥ 2 results in different countries or regions and neither clearly dominates by population, treat the result as ambiguous. Present each candidate's `name`, `admin1`, and `country` and ask the user which they meant.
+
+If the `results` key is missing or the array is empty, the location was not found — ask the user to be more specific.
+
+### Step 2: Fetch Weather from Open-Meteo
+
+Use `WebFetch` to GET the Open-Meteo forecast URL, building it from the resolved coordinates and the desired resolution.
+
+**Base URL:**
+```
+https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&timezone=auto&forecast_days=16
 ```
 
-If `ambiguous` is `true`, an `alternatives` list is included — ask the user which they meant.
-
-### Weather: `scripts/fetch_weather.py`
-
-Fetches weather data for given coordinates.
-
-```bash
-# Current conditions only
-python scripts/fetch_weather.py --lat 35.6764 --lon 139.65 --resolution current
-
-# Hourly forecast (good for today, tomorrow, next 12 hours, specific day)
-python scripts/fetch_weather.py --lat 35.6764 --lon 139.65 --resolution hourly
-
-# Daily forecast (good for multi-day ranges, next week, etc.)
-python scripts/fetch_weather.py --lat 35.6764 --lon 139.65 --resolution daily
-
-# Custom timezone (default is "auto" which uses the location's timezone)
-python scripts/fetch_weather.py --lat 35.6764 --lon 139.65 --resolution hourly --timezone Asia/Tokyo
-
-# Include historical data when user asks about past weather
-python scripts/fetch_weather.py --lat 35.6764 --lon 139.65 --resolution daily --past-days 7
+**Always include** the `current` parameter:
+```
+&current=temperature_2m,apparent_temperature,weather_code,wind_speed_10m,relative_humidity_2m,precipitation
 ```
 
-Returns JSON with `meta`, `current`, `hourly`, and/or `daily` sections depending on resolution.
+**Add parameters based on resolution:**
 
-Example JSON response (`--resolution current`):
-```json
-{
-  "meta": {
-    "lat": 35.6764,
-    "lon": 139.65,
-    "timezone": "Asia/Tokyo",
-    "resolution": "current",
-    "forecast_days": 16,
-    "past_days": 0
-  },
-  "current": {
-    "time": "2026-02-25T14:00",
-    "temperature_c": 12.3,
-    "apparent_temperature_c": 10.8,
-    "weather_code": 1,
-    "weather_description": "Mainly clear",
-    "wind_speed_kmh": 14.2,
-    "humidity_pct": 48,
-    "precipitation_mm": 0.0
-  },
-  "hourly": null,
-  "daily": null
-}
-```
+| Resolution | Additional params |
+|---|---|
+| `current` (now + next 24h) | `&hourly=temperature_2m,apparent_temperature,precipitation_probability,precipitation,weather_code,wind_speed_10m` |
+| `hourly` (specific day / short range) | `&hourly=temperature_2m,apparent_temperature,precipitation_probability,precipitation,weather_code,wind_speed_10m&daily=temperature_2m_max,temperature_2m_min,apparent_temperature_max,apparent_temperature_min,precipitation_sum,precipitation_probability_max,weather_code,wind_speed_10m_max` |
+| `daily` (multi-day / weekly) | `&daily=temperature_2m_max,temperature_2m_min,apparent_temperature_max,apparent_temperature_min,precipitation_sum,precipitation_probability_max,weather_code,wind_speed_10m_max` |
 
-The script always requests `forecast_days=16` (max forecast horizon).
-Use `--past-days` only for past weather requests (`0..92`).
+**Optional params:**
+- `&past_days=N` — include N historical days (0–92). Use only when the user asks about past weather.
+- `&timezone=Asia/Tokyo` — override auto timezone (rarely needed).
+
+**Response structure:**
+- `current` object: `time`, `temperature_2m`, `apparent_temperature`, `weather_code`, `wind_speed_10m`, `relative_humidity_2m`, `precipitation`
+- `hourly` object: `time[]`, `temperature_2m[]`, `apparent_temperature[]`, `precipitation_probability[]`, `precipitation[]`, `weather_code[]`, `wind_speed_10m[]`
+- `daily` object: `time[]`, `temperature_2m_max[]`, `temperature_2m_min[]`, `apparent_temperature_max[]`, `apparent_temperature_min[]`, `precipitation_sum[]`, `precipitation_probability_max[]`, `weather_code[]`, `wind_speed_10m_max[]`
+
+### WMO Weather Code Table
+
+Use this table to convert the numeric `weather_code` in API responses to human-readable descriptions:
+
+| Code | Description |
+|---|---|
+| 0 | Clear sky |
+| 1 | Mainly clear |
+| 2 | Partly cloudy |
+| 3 | Overcast |
+| 45 | Foggy |
+| 48 | Rime fog |
+| 51 | Light drizzle |
+| 53 | Moderate drizzle |
+| 55 | Dense drizzle |
+| 56 | Light freezing drizzle |
+| 57 | Dense freezing drizzle |
+| 61 | Slight rain |
+| 63 | Moderate rain |
+| 65 | Heavy rain |
+| 66 | Light freezing rain |
+| 67 | Heavy freezing rain |
+| 71 | Slight snow |
+| 73 | Moderate snow |
+| 75 | Heavy snow |
+| 77 | Snow grains |
+| 80 | Slight showers |
+| 81 | Moderate showers |
+| 82 | Violent showers |
+| 85 | Slight snow showers |
+| 86 | Heavy snow showers |
+| 95 | Thunderstorm |
+| 96 | Thunderstorm w/ hail |
+| 99 | Thunderstorm w/ heavy hail |
 
 ---
 
@@ -235,28 +247,8 @@ When travel intent is detected, read `references/clothing_guide.md` and include 
 
 ## Error Handling
 
-- **Location not found:** Ask the user to be more specific (add city, country).
+- **Location not found:** The Nominatim response is an empty array. Ask the user to be more specific (add city, country).
 - **Ambiguous location:** Present the alternatives and ask which one.
-- **API failure / network blocked:** Scripts return a JSON error envelope instead of a traceback:
-  ```json
-  {
-    "error": {
-      "code": "NETWORK_UNAVAILABLE",
-      "message": "Unable to reach remote weather service.",
-      "details": "URLError: ...",
-      "retryable": true,
-      "hint": "Enable outbound network access or rerun with elevated permissions."
-    }
-  }
-  ```
-- **Error codes:**
-  - `INVALID_INPUT`: bad user input (invalid `past_days`, missing location, no results).
-  - `NETWORK_UNAVAILABLE`: DNS/connectivity/timeouts to upstream weather APIs.
-  - `UPSTREAM_API_ERROR`: upstream HTTP/API response issues.
-- **Exit codes:**
-  - `0`: success.
-  - `1`: usage or input validation failures.
-  - `2`: network/upstream API failures.
-- **Operational guidance:** If network is blocked in a sandbox, request elevated permissions or run scripts from an environment with outbound internet access.
-- **Beyond forecast horizon:** Inform them of the 16-day limit, return what's available.
+- **WebFetch failure:** If `WebFetch` returns an error or non-JSON response, inform the user that the weather service is temporarily unavailable and suggest retrying.
+- **Beyond forecast horizon:** Inform the user of the 16-day limit, return what's available.
 - **No time specified:** Default to current + next 24 hours.
